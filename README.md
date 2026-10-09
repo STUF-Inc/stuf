@@ -2,7 +2,7 @@
 
 Supply chain security for Rust, designed for targets from bare-metal to cloud. 
 
-**Docs/site:** https://juneswift.github.io/stuf-docs/](https://github.com/STUF-Inc/stuf-docs
+**Docs/site:** https://github.com/STUF-Inc/stuf-docs
 
 ## Architecture
 
