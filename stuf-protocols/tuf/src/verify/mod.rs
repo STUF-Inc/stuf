@@ -26,3 +26,6 @@ pub mod state;
 
 #[cfg(feature = "alloc")]
 pub mod targets;
+
+#[cfg(feature = "tuf-delegation")]
+pub(crate) mod delegation_rules;

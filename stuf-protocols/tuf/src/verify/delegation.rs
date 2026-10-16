@@ -3,6 +3,8 @@
 //! Compiled only with the `tuf-delegation` feature.
 //! No additional cryptographic implementation or dependencies.
 
+use super::delegation_rules::matches_path_pattern;
+
 use crate::{
     error::{Error, Result},
     schema::{role::RoleKeys, signed::Signed, targets::Targets},
@@ -55,36 +57,6 @@ pub(crate) fn verify_delegated_signatures(
     )?;
 
     Ok(Checked(metadata.signed))
-}
-
-/// Match shell-style '*' and '?' without allowing wildcards
-/// to cross a '/' path separator.
-fn matches_path_pattern(pattern: &str, path: &str) -> bool {
-    let pattern: alloc::vec::Vec<char> = pattern.chars().collect();
-    let path: alloc::vec::Vec<char> = path.chars().collect();
-
-    let mut previous = alloc::vec![false; path.len() + 1];
-    previous[0] = true;
-
-    for token in pattern {
-        let mut current = alloc::vec![false; path.len() + 1];
-
-        if token == '*' {
-            current[0] = previous[0];
-        }
-
-        for index in 1..=path.len() {
-            current[index] = match token {
-                '*' => previous[index] || (path[index - 1] != '/' && current[index - 1]),
-                '?' => path[index - 1] != '/' && previous[index - 1],
-                literal => literal == path[index - 1] && previous[index - 1],
-            };
-        }
-
-        previous = current;
-    }
-
-    previous[path.len()]
 }
 
 /// Whether a delegated role is authorized for a target path.
