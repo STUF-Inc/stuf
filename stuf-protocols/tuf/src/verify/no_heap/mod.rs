@@ -42,7 +42,7 @@ enum RoleName {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct KeyView<'a> {
+pub(super) struct KeyView<'a> {
     keyid: &'a str,
     keytype: KeyType,
     scheme: Scheme,
@@ -50,7 +50,7 @@ struct KeyView<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RoleKeysView<'a> {
+pub(super) struct RoleKeysView<'a> {
     keyids: [&'a str; MAX_ROLE_KEYIDS],
     keyids_len: usize,
     threshold: u32,
@@ -588,12 +588,14 @@ fn role_keys<'a>(root: &'a RootView<'a>, role: RoleName) -> Result<RoleKeysView<
     root.roles[role_index(role)].ok_or(Error::NoKeysForRole)
 }
 
-fn find_key<'a>(root: &RootView<'a>, keyid: &str) -> Option<KeyView<'a>> {
-    for i in 0..root.keys_len {
-        if let Some(k) = root.keys[i] {
-            if k.keyid == keyid {
-                return Some(k);
-            }
+fn find_key_in<'a>(
+    keys: &[Option<KeyView<'a>>],
+    keys_len: usize,
+    keyid: &str,
+) -> Option<KeyView<'a>> {
+    for key in keys.iter().take(keys_len).flatten() {
+        if key.keyid == keyid {
+            return Some(*key);
         }
     }
     None
@@ -631,7 +633,37 @@ fn verify_role_signatures(
     role: RoleName,
     limits: &Limits,
 ) -> Result<()> {
-    let role_keys = role_keys(root, role)?;
+    let authorized = role_keys(root, role)?;
+
+    verify_signatures_with_keys(
+        signed_payload,
+        signatures_array,
+        authorized,
+        &root.keys,
+        root.keys_len,
+        limits,
+    )
+}
+
+/// Verify a signed payload against an explicitly authorized key set.
+///
+/// The caller is responsible for authenticating the metadata
+/// that granted this role its signing authority.
+pub(super) fn verify_signatures_with_keys(
+    signed_payload: &[u8],
+    signatures_array: &[u8],
+    role_keys: RoleKeysView<'_>,
+    keys: &[Option<KeyView<'_>>],
+    keys_len: usize,
+    limits: &Limits,
+) -> Result<()> {
+    if role_keys.threshold == 0
+        || role_keys.threshold as usize > role_keys.keyids_len
+        || role_keys.keyids_len == 0
+        || keys_len > keys.len()
+    {
+        return Err(Error::NoKeysForRole);
+    }
     let mut signatures = [None; MAX_SIGNATURES];
     let sig_len = parse_signatures(signatures_array, &mut signatures)?;
     if sig_len > limits.max_signatures {
@@ -655,7 +687,7 @@ fn verify_role_signatures(
         if counted[..counted_len].iter().any(|id| *id == sig.keyid) {
             continue;
         }
-        if let Some(key) = find_key(root, sig.keyid) {
+        if let Some(key) = find_key_in(keys, keys_len, sig.keyid) {
             if key.keytype != KeyType::Ed25519 || key.scheme != Scheme::Ed25519 {
                 continue;
             }
