@@ -57,6 +57,61 @@ pub(crate) fn verify_delegated_signatures(
     Ok(Checked(metadata.signed))
 }
 
+/// Match shell-style '*' and '?' without allowing wildcards
+/// to cross a '/' path separator.
+fn matches_path_pattern(pattern: &str, path: &str) -> bool {
+    let pattern: alloc::vec::Vec<char> = pattern.chars().collect();
+    let path: alloc::vec::Vec<char> = path.chars().collect();
+
+    let mut previous = alloc::vec![false; path.len() + 1];
+    previous[0] = true;
+
+    for token in pattern {
+        let mut current = alloc::vec![false; path.len() + 1];
+
+        if token == '*' {
+            current[0] = previous[0];
+        }
+
+        for index in 1..=path.len() {
+            current[index] = match token {
+                '*' => previous[index] || (path[index - 1] != '/' && current[index - 1]),
+                '?' => path[index - 1] != '/' && previous[index - 1],
+                literal => literal == path[index - 1] && previous[index - 1],
+            };
+        }
+
+        previous = current;
+    }
+
+    previous[path.len()]
+}
+
+/// Whether a delegated role is authorized for a target path.
+///
+/// This checks path restrictions only. It does not authenticate
+/// metadata or authorize installing firmware.
+fn role_allows_path(role: &crate::schema::targets::DelegatedRole, target_path: &str) -> bool {
+    match (&role.paths, &role.path_hash_prefixes) {
+        (Some(patterns), None) => patterns
+            .iter()
+            .any(|pattern| matches_path_pattern(pattern, target_path)),
+
+        (None, Some(prefixes)) => {
+            let digest = stuf_env::crypto::sha256_hex(target_path.as_bytes());
+
+            prefixes.iter().any(|prefix| {
+                !prefix.is_empty()
+                    && prefix.len() <= 64
+                    && prefix.bytes().all(|b| b.is_ascii_hexdigit())
+                    && digest.starts_with(&prefix.to_ascii_lowercase())
+            })
+        }
+
+        _ => false,
+    }
+}
+
 #[cfg(all(test, feature = "crypto-ed25519", feature = "hash-sha256"))]
 mod tests {
     use super::*;
@@ -197,5 +252,74 @@ mod tests {
 
         let result = verify_delegated_signatures(&parent(&[&key], 1), "sensors", metadata);
         assert!(matches!(result, Err(Error::ThresholdNotMet { .. })));
+    }
+}
+
+#[cfg(all(test, feature = "hash-sha256"))]
+mod path_tests {
+    use super::*;
+    use alloc::{string::ToString, vec};
+
+    use crate::schema::targets::DelegatedRole;
+
+    fn role(
+        paths: Option<alloc::vec::Vec<alloc::string::String>>,
+        prefixes: Option<alloc::vec::Vec<alloc::string::String>>,
+    ) -> DelegatedRole {
+        DelegatedRole {
+            name: "sensors".to_string(),
+            keyids: vec![],
+            threshold: 1,
+            terminating: false,
+            paths,
+            path_hash_prefixes: prefixes,
+        }
+    }
+
+    #[test]
+    fn authorized_sensor_path_passes() {
+        let r = role(Some(vec!["sensors/*".to_string()]), None);
+        assert!(role_allows_path(&r, "sensors/temperature.bin"));
+    }
+
+    #[test]
+    fn unauthorized_controller_path_fails() {
+        let r = role(Some(vec!["sensors/*".to_string()]), None);
+        assert!(!role_allows_path(&r, "controllers/motor.bin"));
+    }
+
+    #[test]
+    fn wildcard_cannot_cross_directory() {
+        let r = role(Some(vec!["sensors/*".to_string()]), None);
+        assert!(!role_allows_path(&r, "sensors/subdir/firmware.bin"));
+    }
+
+    #[test]
+    fn question_mark_matches_one_character() {
+        let r = role(Some(vec!["firmware-?.bin".to_string()]), None);
+        assert!(role_allows_path(&r, "firmware-a.bin"));
+        assert!(!role_allows_path(&r, "firmware-alpha.bin"));
+    }
+
+    #[test]
+    fn hash_prefix_authorizes_matching_target() {
+        let path = "sensors/temperature.bin";
+        let digest = stuf_env::crypto::sha256_hex(path.as_bytes());
+        let prefix = digest[..8].to_string();
+
+        let r = role(None, Some(vec![prefix]));
+        assert!(role_allows_path(&r, path));
+    }
+
+    #[test]
+    fn invalid_hash_prefix_fails_closed() {
+        let r = role(None, Some(vec!["not-hex".to_string()]));
+        assert!(!role_allows_path(&r, "sensors/temperature.bin"));
+    }
+
+    #[test]
+    fn unrestricted_role_fails_closed() {
+        let r = role(None, None);
+        assert!(!role_allows_path(&r, "anything.bin"));
     }
 }
