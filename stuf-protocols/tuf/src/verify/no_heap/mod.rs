@@ -744,3 +744,61 @@ fn hex_nibble(b: u8) -> core::result::Result<u8, ()> {
         _ => Err(()),
     }
 }
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn too_many_targets_fail_without_panicking() {
+        let metadata = br#"{
+            "_type":"targets",
+            "spec_version":"1.0.0",
+            "version":1,
+            "expires":2000000000,
+            "targets":{
+                "t1":{"length":1,"hashes":{"sha256":"a"}},
+                "t2":{"length":1,"hashes":{"sha256":"a"}},
+                "t3":{"length":1,"hashes":{"sha256":"a"}},
+                "t4":{"length":1,"hashes":{"sha256":"a"}},
+                "t5":{"length":1,"hashes":{"sha256":"a"}},
+                "t6":{"length":1,"hashes":{"sha256":"a"}},
+                "t7":{"length":1,"hashes":{"sha256":"a"}},
+                "t8":{"length":1,"hashes":{"sha256":"a"}},
+                "t9":{"length":1,"hashes":{"sha256":"a"}}
+            }
+        }"#;
+
+        assert!(matches!(
+            parse_targets(metadata, &Limits::default()),
+            Err(Error::TooManyTargets {
+                limit: 8,
+                actual: 9
+            })
+        ));
+    }
+
+    #[test]
+    fn too_many_root_keys_fail_without_panicking() {
+        let metadata = br#"{
+            "_type":"root",
+            "spec_version":"1.0.0",
+            "version":1,
+            "expires":2000000000,
+            "keys":{
+                "k1":{}, "k2":{}, "k3":{},
+                "k4":{}, "k5":{}, "k6":{},
+                "k7":{}, "k8":{}, "k9":{}
+            },
+            "roles":{}
+        }"#;
+
+        assert!(matches!(
+            parse_root(metadata, &Limits::default()),
+            Err(Error::TooManyKeys {
+                limit: 8,
+                actual: 9
+            })
+        ));
+    }
+}
