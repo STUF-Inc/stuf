@@ -99,6 +99,8 @@ struct SnapshotView<'a> {
     expires: u64,
     version: u32,
     targets: MetaView<'a>,
+    #[cfg(feature = "tuf-delegation")]
+    meta_raw: &'a [u8],
 }
 #[derive(Clone, Copy, Debug)]
 struct TargetsView<'a> {
@@ -106,6 +108,8 @@ struct TargetsView<'a> {
     version: u32,
     targets: [Option<TargetView<'a>>; MAX_TARGETS],
     targets_len: usize,
+    #[cfg(feature = "tuf-delegation")]
+    delegations_raw: Option<&'a [u8]>,
 }
 
 /// Entry point for no-heap verification.
@@ -328,6 +332,92 @@ where
         Ok(Verified::new(t))
     }
 
+    /// Authenticate and verify a one-level delegated firmware target.
+    ///
+    /// Delegation authority originates in authenticated parent
+    /// targets and snapshot metadata.
+    ///
+    /// Recursive traversal and persistent rollback tracking
+    /// are not implemented by this method.
+    #[cfg(feature = "tuf-delegation")]
+    pub fn verify_delegated_target_bytes<'delegate>(
+        &self,
+        role_name: &str,
+        metadata: &'delegate [u8],
+        target_name: &str,
+        firmware: &[u8],
+    ) -> Result<Verified<TargetView<'delegate>>> {
+        // A delegated role cannot override a top-level target.
+        if self.find_target(target_name).is_some() {
+            return Err(Error::TargetNotFound);
+        }
+
+        // Read delegation authority from the verified parent.
+        let parent_raw = self.targets.delegations_raw.ok_or(Error::NoKeysForRole)?;
+
+        let parent = delegations::parse_delegations(parent_raw)?;
+
+        // Respect the parent's delegation order and terminating roles.
+        let mut selected = false;
+
+        for candidate in parent.roles[..parent.roles_len].iter().flatten() {
+            if delegated_scope_allows(candidate.scope, target_name) {
+                if candidate.name == role_name {
+                    selected = true;
+                    break;
+                }
+
+                if candidate.terminating {
+                    return Err(Error::TargetNotFound);
+                }
+            }
+        }
+
+        if !selected {
+            return Err(Error::TargetNotFound);
+        }
+
+        // The snapshot reference is part of verified metadata.
+        let reference = delegated_snapshot_ref(self.snapshot.meta_raw, role_name)?;
+
+        check_size(metadata, self.limits.max_targets_bytes, "targets")?;
+
+        verify_metadata_ref(metadata, reference)?;
+
+        // Verify the delegated role's signatures and threshold.
+        verify_delegated_signatures_bytes(&parent, role_name, metadata, &self.limits)?;
+
+        let signed = signed_payload(metadata)?;
+        let child = parse_targets(signed, &self.limits)?;
+
+        if child.version != reference.version {
+            return Err(Error::VersionMismatch {
+                expected: reference.version,
+                received: child.version,
+            });
+        }
+
+        check_expiry(child.expires, &self.clock)?;
+
+        let target = child.targets[..child.targets_len]
+            .iter()
+            .flatten()
+            .find(|t| t.name == target_name)
+            .copied()
+            .ok_or(Error::TargetNotFound)?;
+
+        if firmware.len() as u64 != target.length {
+            return Err(Error::TargetLengthMismatch {
+                expected: target.length,
+                actual: firmware.len() as u64,
+            });
+        }
+
+        verify_sha256_hex(firmware, target.sha256)?;
+
+        Ok(Verified::new(target))
+    }
+
     pub fn find_target(&self, name: &str) -> Option<TargetView<'targets>> {
         for i in 0..self.targets.targets_len {
             if let Some(t) = self.targets.targets[i] {
@@ -337,6 +427,57 @@ where
             }
         }
         None
+    }
+}
+
+#[cfg(feature = "tuf-delegation")]
+fn delegated_snapshot_ref<'a>(meta: &'a [u8], role_name: &str) -> Result<MetaView<'a>> {
+    if role_name.is_empty()
+        || role_name.contains('/')
+        || role_name.contains('\\')
+        || role_name == "."
+        || role_name == ".."
+        || role_name.ends_with(".json")
+    {
+        return Err(Error::SnapshotMismatch);
+    }
+
+    let mut entries = [empty_entry(); MAX_OBJECT_FIELDS];
+
+    let count = enc::object_entries(meta, &mut entries).map_err(|_| Error::SnapshotMismatch)?;
+
+    let mut found = None;
+
+    for entry in entries.iter().take(count) {
+        if entry.key.strip_suffix(".json") == Some(role_name) {
+            if found.is_some() {
+                return Err(Error::SnapshotMismatch);
+            }
+
+            found = Some(parse_meta(entry.value)?);
+        }
+    }
+
+    found.ok_or(Error::SnapshotMismatch)
+}
+
+#[cfg(feature = "tuf-delegation")]
+fn delegated_scope_allows(scope: delegations::PathScope<'_>, target: &str) -> bool {
+    match scope {
+        delegations::PathScope::Paths(patterns, count) => patterns[..count]
+            .iter()
+            .any(|pattern| crate::verify::delegation_rules::matches_path_pattern(pattern, target)),
+
+        delegations::PathScope::HashPrefixes(prefixes, count) => {
+            let digest = stuf_env::crypto::sha256_hex(target.as_bytes());
+
+            prefixes[..count].iter().any(|prefix| {
+                !prefix.is_empty()
+                    && digest
+                        .get(..prefix.len())
+                        .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+            })
+        }
     }
 }
 
@@ -492,6 +633,8 @@ fn parse_snapshot<'a>(signed: &'a [u8]) -> Result<SnapshotView<'a>> {
         expires,
         version,
         targets: parse_meta(targets)?,
+        #[cfg(feature = "tuf-delegation")]
+        meta_raw: meta,
     })
 }
 
@@ -541,6 +684,8 @@ fn parse_targets<'a>(signed: &'a [u8], limits: &Limits) -> Result<TargetsView<'a
         version,
         targets: [None; MAX_TARGETS],
         targets_len: 0,
+        #[cfg(feature = "tuf-delegation")]
+        delegations_raw: enc::field(signed, "delegations").ok(),
     };
     for e in entries.iter().take(n) {
         let length = get_u64(e.value, "length")?;
@@ -884,6 +1029,56 @@ mod capacity_tests {
                 actual: 9
             })
         ));
+    }
+}
+
+#[cfg(all(test, feature = "tuf-delegation"))]
+mod delegated_chain_guard_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_lookup_requires_exact_role() {
+        let meta = br#"{
+            "sensors.json":{"version":4},
+            "controllers.json":{"version":7}
+        }"#;
+
+        assert_eq!(delegated_snapshot_ref(meta, "sensors").unwrap().version, 4);
+
+        assert!(delegated_snapshot_ref(meta, "sensor").is_err());
+
+        assert!(delegated_snapshot_ref(meta, "../sensors").is_err());
+
+        assert!(delegated_snapshot_ref(meta, "sensors.json").is_err());
+    }
+
+    #[test]
+    fn delegated_paths_reject_out_of_scope_targets() {
+        let scope = delegations::PathScope::Paths(["sensors/*", "", "", "", "", "", "", ""], 1);
+
+        assert!(delegated_scope_allows(scope, "sensors/firmware.bin"));
+
+        assert!(!delegated_scope_allows(scope, "controllers/firmware.bin"));
+
+        assert!(!delegated_scope_allows(
+            scope,
+            "sensors/nested/firmware.bin"
+        ));
+    }
+
+    #[test]
+    fn delegated_hash_prefixes_are_scoped() {
+        let target = "sensors/firmware.bin";
+
+        let digest = stuf_env::crypto::sha256_hex(target.as_bytes());
+
+        let prefix = &digest[..4];
+
+        let scope = delegations::PathScope::HashPrefixes([prefix, "", "", "", "", "", "", ""], 1);
+
+        assert!(delegated_scope_allows(scope, target));
+
+        assert!(!delegated_scope_allows(scope, "other.bin"));
     }
 }
 
