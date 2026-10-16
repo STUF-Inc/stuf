@@ -1,7 +1,7 @@
 #[cfg(feature = "alloc")]
 pub mod chain;
 
-#[cfg(feature = "tuf-delegation")]
+#[cfg(all(feature = "tuf-delegation", feature = "alloc"))]
 pub mod delegation;
 
 #[cfg(feature = "alloc")]
