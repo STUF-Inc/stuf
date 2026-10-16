@@ -91,7 +91,10 @@ fn matches_path_pattern(pattern: &str, path: &str) -> bool {
 ///
 /// This checks path restrictions only. It does not authenticate
 /// metadata or authorize installing firmware.
-fn role_allows_path(role: &crate::schema::targets::DelegatedRole, target_path: &str) -> bool {
+pub(crate) fn role_allows_path(
+    role: &crate::schema::targets::DelegatedRole,
+    target_path: &str,
+) -> bool {
     match (&role.paths, &role.path_hash_prefixes) {
         (Some(patterns), None) => patterns
             .iter()

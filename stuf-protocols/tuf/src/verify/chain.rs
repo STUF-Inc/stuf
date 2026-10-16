@@ -544,6 +544,68 @@ where
         Ok(checked)
     }
 
+    /// Verify a target in the top-level role or a direct delegation.
+    ///
+    /// Initial one-level implementation. Nested roles are not
+    /// yet supported; this is not the final delegation API.
+    #[cfg(feature = "tuf-delegation")]
+    pub fn verify_target_delegated_one_level(&self, name: &str) -> Result<Verified<Target>> {
+        use crate::verify::delegation::role_allows_path;
+
+        if self.targets.get().get_target(name).is_some() {
+            return self.verify_target(name);
+        }
+
+        let delegations = self
+            .targets
+            .get()
+            .delegations
+            .as_ref()
+            .ok_or(Error::TargetNotFound)?;
+
+        // Conservative bound until configurable traversal
+        // limits are added.
+        if delegations.roles.len() > 32 {
+            return Err(Error::TargetNotFound);
+        }
+
+        for role in &delegations.roles {
+            if !role_allows_path(role, name) {
+                continue;
+            }
+
+            let filename = alloc::format!("{}.json", role.name);
+            let bytes = self
+                .transport
+                .fetch(&filename)
+                .map_err(|_| Error::Transport)?;
+
+            let checked =
+                self.verify_delegated_metadata_bytes(&self.targets, &role.name, bytes.as_ref())?;
+
+            if let Some(target) = checked.get().get_target(name) {
+                let firmware = self.transport.fetch(name).map_err(|_| Error::Transport)?;
+
+                if firmware.as_ref().len() as u64 != target.length {
+                    return Err(Error::TargetLengthMismatch {
+                        expected: target.length,
+                        actual: firmware.as_ref().len() as u64,
+                    });
+                }
+
+                verify_target_hashes(firmware.as_ref(), &target.hashes)?;
+
+                return Ok(Verified::new(target.clone()));
+            }
+
+            if role.terminating {
+                return Err(Error::TargetNotFound);
+            }
+        }
+
+        Err(Error::TargetNotFound)
+    }
+
     pub fn targets(&self) -> &Checked<Targets> {
         &self.targets
     }
