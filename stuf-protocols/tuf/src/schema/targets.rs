@@ -24,25 +24,53 @@ pub struct Target {
     pub custom: BTreeMap<String, alloc::string::String>,
 }
 
-/// Target paths a delegated role is authoritative for.
-/// MVP: delegation is stubbed, PathSet is here for schema completeness.
+/// A delegated role's authorized signing keys and target paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum PathSet {
-    Paths { paths: Vec<String> },
-    Any,
-}
-
-/// A delegated role entry within a targets file.
-/// MVP: delegation is stubbed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawDelegatedRole")]
 pub struct DelegatedRole {
     pub name: String,
     pub keyids: Vec<crate::schema::keys::KeyId>,
     pub threshold: u32,
-    pub paths: PathSet,
     #[serde(default)]
     pub terminating: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paths: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_hash_prefixes: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct RawDelegatedRole {
+    name: String,
+    keyids: Vec<crate::schema::keys::KeyId>,
+    threshold: u32,
+    #[serde(default)]
+    terminating: bool,
+    paths: Option<Vec<String>>,
+    path_hash_prefixes: Option<Vec<String>>,
+}
+
+impl TryFrom<RawDelegatedRole> for DelegatedRole {
+    type Error = &'static str;
+
+    fn try_from(raw: RawDelegatedRole) -> Result<Self, Self::Error> {
+        if raw.paths.is_some() == raw.path_hash_prefixes.is_some() {
+            return Err("exactly one delegation path restriction is required");
+        }
+
+        if raw.threshold == 0 || raw.keyids.is_empty() {
+            return Err("delegation requires keys and a positive threshold");
+        }
+
+        Ok(Self {
+            name: raw.name,
+            keyids: raw.keyids,
+            threshold: raw.threshold,
+            terminating: raw.terminating,
+            paths: raw.paths,
+            path_hash_prefixes: raw.path_hash_prefixes,
+        })
+    }
 }
 
 /// Delegations block within a targets file.
