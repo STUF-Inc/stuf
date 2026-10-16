@@ -1,3 +1,4 @@
+#![cfg(feature = "alloc")]
 #![cfg(feature = "tuf-delegation")]
 
 use stuf_tuf::schema::targets::DelegatedRole;

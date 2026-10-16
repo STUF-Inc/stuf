@@ -1,3 +1,4 @@
+#![cfg(feature = "alloc")]
 #![cfg(feature = "tuf-delegation")]
 
 mod common;

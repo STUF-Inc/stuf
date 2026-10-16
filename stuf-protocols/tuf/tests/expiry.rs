@@ -1,3 +1,5 @@
+#![cfg(feature = "alloc")]
+
 mod common;
 
 use stuf_env::clock::FixedClock;
