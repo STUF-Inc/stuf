@@ -3,6 +3,7 @@
 //! Parsing is not authentication. These views become authoritative
 //! only after the parent metadata has been verified.
 
+use super::{parse_key, KeyView, MAX_KEYS};
 use crate::error::{Error, Result};
 use stuf_encoding::no_heap as enc;
 
@@ -30,6 +31,57 @@ pub(super) struct DelegatedRoleView<'a> {
 pub(super) struct DelegationsView<'a> {
     pub roles: [Option<DelegatedRoleView<'a>>; MAX_ROLES],
     pub roles_len: usize,
+    pub keys: [Option<KeyView<'a>>; MAX_KEYS],
+    pub keys_len: usize,
+}
+
+/// Parse delegated keys and roles from the same parent metadata.
+///
+/// This is structural validation only. The parent's signatures
+/// must be verified before the returned views can confer trust.
+pub(super) fn parse_delegations<'a>(delegations: &'a [u8]) -> Result<DelegationsView<'a>> {
+    let mut out = parse_roles(delegations)?;
+
+    let keys_object = enc::field(delegations, "keys").map_err(|_| Error::Deserialize)?;
+
+    let empty = enc::ObjectEntry {
+        key: "",
+        raw_key: &[],
+        value: &[],
+    };
+    let mut entries = [empty; MAX_KEYS];
+
+    let count = enc::object_entries(keys_object, &mut entries).map_err(|_| Error::NoKeysForRole)?;
+
+    for entry in entries.iter().take(count) {
+        if entry.key.is_empty()
+            || out.keys[..out.keys_len]
+                .iter()
+                .flatten()
+                .any(|key| key.keyid == entry.key)
+        {
+            return Err(Error::NoKeysForRole);
+        }
+
+        let key = parse_key(entry.key, entry.value)?;
+
+        out.keys[out.keys_len] = Some(key);
+        out.keys_len += 1;
+    }
+
+    for role in out.roles[..out.roles_len].iter().flatten() {
+        for keyid in role.keyids[..role.keyids_len].iter() {
+            if !out.keys[..out.keys_len]
+                .iter()
+                .flatten()
+                .any(|key| key.keyid == *keyid)
+            {
+                return Err(Error::NoKeysForRole);
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 // This stage parses roles only. The separate delegations.keys
@@ -43,6 +95,8 @@ pub(super) fn parse_roles<'a>(delegations: &'a [u8]) -> Result<DelegationsView<'
     let mut result = DelegationsView {
         roles: [None; MAX_ROLES],
         roles_len: 0,
+        keys: [None; MAX_KEYS],
+        keys_len: 0,
     };
 
     for item in items.iter().take(count) {
@@ -146,6 +200,8 @@ fn get_u64(obj: &[u8], name: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
@@ -203,5 +259,70 @@ mod tests {
     fn rejects_oversized_role_array() {
         let json = br#"{"roles":[{},{},{},{},{},{},{},{},{}]}"#;
         assert!(parse_roles(json).is_err());
+    }
+
+    fn metadata(keyids: &str, keys: &str) -> std::string::String {
+        std::format!(
+            r#"{{"keys":{{{keys}}},"roles":[{{
+                "name":"sensors",
+                "keyids":{keyids},
+                "threshold":1,
+                "terminating":false,
+                "paths":["sensors/*"]
+            }}]}}"#
+        )
+    }
+
+    fn valid_key() -> std::string::String {
+        let hex = "00".repeat(32);
+        std::format!(
+            r#""key1":{{
+                "keytype":"ed25519",
+                "scheme":"ed25519",
+                "keyval":{{"public":"{hex}"}}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn authorized_key_reference_passes() {
+        let json = metadata(r#"["key1"]"#, &valid_key());
+        let parsed = parse_delegations(json.as_bytes()).unwrap();
+        assert_eq!(parsed.keys_len, 1);
+        assert_eq!(parsed.roles_len, 1);
+        assert_eq!(parsed.keys[0].unwrap().keyid, "key1");
+    }
+
+    #[test]
+    fn unknown_key_reference_is_rejected() {
+        let json = metadata(r#"["attacker"]"#, &valid_key());
+        assert!(matches!(
+            parse_delegations(json.as_bytes()),
+            Err(Error::NoKeysForRole)
+        ));
+    }
+
+    #[test]
+    fn invalid_public_key_is_rejected() {
+        let invalid = r#""key1":{
+            "keytype":"ed25519",
+            "scheme":"ed25519",
+            "keyval":{"public":"not-hex"}
+        }"#;
+        let json = metadata(r#"["key1"]"#, invalid);
+        assert!(parse_delegations(json.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn oversized_key_map_is_rejected() {
+        let mut keys = std::string::String::new();
+        for n in 0..9 {
+            if n > 0 {
+                keys.push(',');
+            }
+            keys.push_str(&std::format!(r#""key{n}":{{}}"#));
+        }
+        let json = metadata(r#"["key1"]"#, &keys);
+        assert!(parse_delegations(json.as_bytes()).is_err());
     }
 }
