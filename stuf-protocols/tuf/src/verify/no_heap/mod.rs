@@ -386,9 +386,9 @@ fn parse_root<'a>(signed: &'a [u8], limits: &Limits) -> Result<RootView<'a>> {
     let keys_obj = enc::field(signed, "keys").map_err(|_| Error::Deserialize)?;
     let mut entries = [empty_entry(); MAX_OBJECT_FIELDS];
     let n = enc::object_entries(keys_obj, &mut entries).map_err(|_| Error::Deserialize)?;
-    if n > limits.max_keys {
+    if n > limits.max_keys || n > MAX_KEYS {
         return Err(Error::TooManyKeys {
-            limit: limits.max_keys,
+            limit: limits.max_keys.min(MAX_KEYS),
             actual: n,
         });
     }
@@ -527,9 +527,9 @@ fn parse_targets<'a>(signed: &'a [u8], limits: &Limits) -> Result<TargetsView<'a
     let targets_obj = enc::field(signed, "targets").map_err(|_| Error::Deserialize)?;
     let mut entries = [empty_entry(); MAX_OBJECT_FIELDS];
     let n = enc::object_entries(targets_obj, &mut entries).map_err(|_| Error::Deserialize)?;
-    if n > limits.max_targets_entries {
+    if n > limits.max_targets_entries || n > MAX_TARGETS {
         return Err(Error::TooManyTargets {
-            limit: limits.max_targets_entries,
+            limit: limits.max_targets_entries.min(MAX_TARGETS),
             actual: n,
         });
     }
