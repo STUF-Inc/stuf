@@ -490,6 +490,60 @@ where
         Ok(Verified::new(target_meta.clone()))
     }
 
+    /// Verify a delegated targets metadata file against its
+    /// authenticated parent and the trusted snapshot.
+    ///
+    /// This does not yet authorize a firmware target.
+    #[cfg(feature = "tuf-delegation")]
+    fn verify_delegated_metadata_bytes(
+        &self,
+        parent: &Checked<Targets>,
+        role_name: &str,
+        bytes: &[u8],
+    ) -> Result<Checked<Targets>> {
+        use crate::verify::delegation::verify_delegated_signatures;
+
+        check_size(bytes, self.limits.max_targets_bytes, "targets")?;
+
+        // The trusted snapshot must identify this metadata file.
+        let filename = alloc::format!("{role_name}.json");
+
+        let expected = self
+            .snapshot
+            .get()
+            .meta_for(&filename)
+            .ok_or(Error::SnapshotMismatch)?;
+
+        // Verify integrity against snapshot metadata.
+        if let Some(ref hashes) = expected.hashes {
+            verify_metadata_hash(bytes, hashes)?;
+        }
+        verify_metadata_length(bytes, expected.length)?;
+
+        // Deserialize and enforce signature-count limits.
+        let signed: Signed<Targets> = stuf_encoding::decode(bytes)?;
+        check_signature_limits(&signed, &self.limits)?;
+
+        // Authenticate using keys authorized by the parent.
+        let checked = verify_delegated_signatures(parent, role_name, signed)?;
+
+        // Enforce the same structural limits as top-level targets.
+        check_targets_limits(checked.get(), &self.limits)?;
+
+        // The delegated version must match the trusted snapshot.
+        if checked.get().version() != expected.version {
+            return Err(Error::VersionMismatch {
+                expected: expected.version,
+                received: checked.get().version(),
+            });
+        }
+
+        // Delegated metadata must not be expired.
+        check_expiry(checked.get().expires(), &self.clock)?;
+
+        Ok(checked)
+    }
+
     pub fn targets(&self) -> &Checked<Targets> {
         &self.targets
     }
