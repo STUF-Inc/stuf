@@ -3,6 +3,9 @@
 //! This module owns only TUF-specific interpretation. Generic no-heap JSON/JCS
 //! scanning lives in `stuf-encoding::no_heap`.
 
+#[cfg(feature = "tuf-delegation")]
+mod delegations;
+
 use stuf_core::trust::Verified;
 use stuf_encoding::no_heap as enc;
 
