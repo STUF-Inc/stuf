@@ -708,6 +708,55 @@ pub(super) fn verify_signatures_with_keys(
     }
 }
 
+/// Authenticate child metadata using a parent's delegated-role keys.
+///
+/// SECURITY: `parent` must come from authenticated parent targets
+/// metadata. This helper does not check snapshot consistency, expiry,
+/// rollback, or target path authorization.
+#[cfg(feature = "tuf-delegation")]
+fn verify_delegated_signatures_bytes(
+    parent: &delegations::DelegationsView<'_>,
+    role_name: &str,
+    child_bytes: &[u8],
+    limits: &Limits,
+) -> Result<()> {
+    let role = parent.roles[..parent.roles_len]
+        .iter()
+        .flatten()
+        .find(|role| role.name == role_name)
+        .ok_or(Error::NoKeysForRole)?;
+
+    let authorized = RoleKeysView {
+        keyids: role.keyids,
+        keyids_len: role.keyids_len,
+        threshold: role.threshold,
+    };
+
+    let signed = signed_payload(child_bytes)?;
+    let sigs = signatures(child_bytes)?;
+
+    // A delegated metadata file is a targets role, not root,
+    // timestamp, or snapshot.
+    let role_type = get_str(signed, "_type")?;
+    if role_type != "targets" {
+        return Err(Error::role_type_mismatch("targets", role_label(role_type)));
+    }
+
+    let spec_version = get_str(signed, "spec_version")?;
+    if !spec_version.starts_with("1.") {
+        return Err(Error::UnsupportedSpecVersion);
+    }
+
+    verify_signatures_with_keys(
+        signed,
+        sigs,
+        authorized,
+        &parent.keys,
+        parent.keys_len,
+        limits,
+    )
+}
+
 fn role_contains_keyid(role: RoleKeysView<'_>, keyid: &str) -> bool {
     role.keyids[..role.keyids_len].iter().any(|id| *id == keyid)
 }
@@ -835,5 +884,212 @@ mod capacity_tests {
                 actual: 9
             })
         ));
+    }
+}
+
+#[cfg(all(test, feature = "tuf-delegation"))]
+mod delegated_signature_tests {
+    use super::*;
+
+    fn parent<'a>() -> delegations::DelegationsView<'a> {
+        delegations::DelegationsView {
+            roles: [None; 8],
+            roles_len: 0,
+            keys: [None; MAX_KEYS],
+            keys_len: 0,
+        }
+    }
+
+    #[test]
+    fn undeclared_role_cannot_authorize_metadata() {
+        let child = br#"{
+            "signed":{
+                "_type":"targets",
+                "spec_version":"1.0.0"
+            },
+            "signatures":[]
+        }"#;
+
+        let result =
+            verify_delegated_signatures_bytes(&parent(), "unknown", child, &Limits::default());
+
+        assert!(matches!(result, Err(Error::NoKeysForRole)));
+    }
+
+    #[test]
+    fn wrong_metadata_type_is_rejected() {
+        let mut parent = parent();
+        parent.roles[0] = Some(delegations::DelegatedRoleView {
+            name: "sensors",
+            keyids: ["key1", "", "", "", "", "", "", ""],
+            keyids_len: 1,
+            threshold: 1,
+            terminating: false,
+            scope: delegations::PathScope::Paths(["sensors/*", "", "", "", "", "", "", ""], 1),
+        });
+        parent.roles_len = 1;
+
+        let child = br#"{
+            "signed":{
+                "_type":"snapshot",
+                "spec_version":"1.0.0"
+            },
+            "signatures":[]
+        }"#;
+
+        assert!(matches!(
+            verify_delegated_signatures_bytes(&parent, "sensors", child, &Limits::default(),),
+            Err(Error::RoleTypeMismatch { .. })
+        ));
+    }
+
+    extern crate std;
+
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn signed(version: u32) -> std::string::String {
+        std::format!(
+            r#"{{"_type":"targets","spec_version":"1.0.0",
+                "version":{version},"expires":4102444800,
+                "targets":{{}}}}"#
+        )
+    }
+
+    fn signature(key: &SigningKey, keyid: &str, payload: &str) -> std::string::String {
+        let mut buf = [0u8; MAX_CANONICAL_BYTES];
+        let canonical = enc::canonicalize_json_to_buf(payload.as_bytes(), &mut buf).unwrap();
+
+        let sig = key.sign(canonical);
+        std::format!(
+            r#"{{"keyid":"{keyid}","sig":"{}"}}"#,
+            hex::encode(sig.to_bytes())
+        )
+    }
+
+    fn child(payload: &str, signatures: &str) -> std::string::String {
+        std::format!(r#"{{"signed":{payload},"signatures":[{signatures}]}}"#)
+    }
+
+    fn authorized_parent(
+        threshold: u32,
+        key1: &SigningKey,
+        key2: &SigningKey,
+    ) -> delegations::DelegationsView<'static> {
+        let mut p = parent();
+
+        p.roles[0] = Some(delegations::DelegatedRoleView {
+            name: "sensors",
+            keyids: ["k1", "k2", "", "", "", "", "", ""],
+            keyids_len: 2,
+            threshold,
+            terminating: false,
+            scope: delegations::PathScope::Paths(["sensors/*", "", "", "", "", "", "", ""], 1),
+        });
+        p.roles_len = 1;
+
+        p.keys[0] = Some(KeyView {
+            keyid: "k1",
+            keytype: KeyType::Ed25519,
+            scheme: Scheme::Ed25519,
+            public: key1.verifying_key().to_bytes(),
+        });
+        p.keys[1] = Some(KeyView {
+            keyid: "k2",
+            keytype: KeyType::Ed25519,
+            scheme: Scheme::Ed25519,
+            public: key2.verifying_key().to_bytes(),
+        });
+        p.keys_len = 2;
+        p
+    }
+
+    fn check(parent: &delegations::DelegationsView<'_>, bytes: &[u8]) -> Result<()> {
+        verify_delegated_signatures_bytes(parent, "sensors", bytes, &Limits::default())
+    }
+
+    #[test]
+    fn valid_delegated_ed25519_signature_passes() {
+        let k1 = signing_key(1);
+        let k2 = signing_key(2);
+        let parent = authorized_parent(1, &k1, &k2);
+        let payload = signed(1);
+        let sig = signature(&k1, "k1", &payload);
+        let metadata = child(&payload, &sig);
+
+        assert!(check(&parent, metadata.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn unauthorized_delegated_signer_fails() {
+        let k1 = signing_key(1);
+        let k2 = signing_key(2);
+        let attacker = signing_key(3);
+        let parent = authorized_parent(1, &k1, &k2);
+        let payload = signed(1);
+
+        // The attacker claims an authorized key ID but cannot
+        // produce a signature from that key.
+        let sig = signature(&attacker, "k1", &payload);
+        let metadata = child(&payload, &sig);
+
+        assert!(matches!(
+            check(&parent, metadata.as_bytes()),
+            Err(Error::ThresholdNotMet { .. })
+        ));
+    }
+
+    #[test]
+    fn tampered_delegated_payload_fails() {
+        let k1 = signing_key(1);
+        let k2 = signing_key(2);
+        let parent = authorized_parent(1, &k1, &k2);
+
+        let original = signed(1);
+        let altered = signed(2);
+        let sig = signature(&k1, "k1", &original);
+        let metadata = child(&altered, &sig);
+
+        assert!(matches!(
+            check(&parent, metadata.as_bytes()),
+            Err(Error::ThresholdNotMet { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_delegated_signature_cannot_meet_threshold() {
+        let k1 = signing_key(1);
+        let k2 = signing_key(2);
+        let parent = authorized_parent(2, &k1, &k2);
+        let payload = signed(1);
+        let sig = signature(&k1, "k1", &payload);
+        let duplicates = std::format!("{sig},{sig}");
+        let metadata = child(&payload, &duplicates);
+
+        assert!(matches!(
+            check(&parent, metadata.as_bytes()),
+            Err(Error::ThresholdNotMet {
+                threshold: 2,
+                valid: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn two_distinct_delegated_signatures_meet_threshold() {
+        let k1 = signing_key(1);
+        let k2 = signing_key(2);
+        let parent = authorized_parent(2, &k1, &k2);
+        let payload = signed(1);
+
+        let sig1 = signature(&k1, "k1", &payload);
+        let sig2 = signature(&k2, "k2", &payload);
+        let signatures = std::format!("{sig1},{sig2}");
+        let metadata = child(&payload, &signatures);
+
+        assert!(check(&parent, metadata.as_bytes()).is_ok());
     }
 }
